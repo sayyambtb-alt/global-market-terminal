@@ -7,6 +7,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 import json
 import io
+import time
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -24,46 +25,79 @@ st.markdown("""
 .sig-card{border-radius:8px;padding:14px 16px;text-align:center;border-top:3px solid;}
 </style>""", unsafe_allow_html=True)
 
+# ── YFINANCE RESILIENCE LAYER ──────────────────────────────────────────────
+# Yahoo Finance is an unofficial, scraped data source and rate-limits (HTTP 429)
+# aggressively — especially from shared-IP hosts like Streamlit Community Cloud.
+# safe_yf_call retries once or twice with backoff specifically on rate-limit
+# errors, and returns None on final failure instead of raising, so callers get
+# a clean "unavailable" state instead of an uncaught exception taking the page
+# down.
+def _is_rate_limit_error(e):
+    msg = str(e).lower()
+    return "429" in msg or "rate limit" in msg or "too many requests" in msg
+
+def safe_yf_call(fn, retries=2, base_delay=1.5):
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if _is_rate_limit_error(e) and attempt < retries:
+                time.sleep(base_delay * (attempt + 1))
+                continue
+            return None
+    return None
+
 # ── CACHING ──────────────────────────────────────────────────────────────────
+# Price/quote data: 1h TTL (unchanged — balances freshness vs. call volume).
+# Financial statements: 6h TTL — these only change quarterly, so there is no
+# reason to re-hit Yahoo for them every hour; this alone cuts a large share of
+# the outbound calls that were triggering rate limits.
 @st.cache_data(ttl=3600)
 def cached_history(ticker, period="1y"):
-    d = yf.Ticker(ticker).history(period=period)
-    return d.dropna(subset=["Close"]) if not d.empty else d
+    d = safe_yf_call(lambda: yf.Ticker(ticker).history(period=period))
+    if d is None or d.empty: return pd.DataFrame()
+    return d.dropna(subset=["Close"])
 
 @st.cache_data(ttl=3600)
 def cached_info(ticker):
-    return yf.Ticker(ticker).info
+    d = safe_yf_call(lambda: yf.Ticker(ticker).info)
+    return d if d is not None else {}
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=21600)
 def cached_income_stmt(ticker):
-    obj = yf.Ticker(ticker)
-    return obj.income_stmt if (hasattr(obj,"income_stmt") and not obj.income_stmt.empty) else obj.financials
+    def _fetch():
+        obj = yf.Ticker(ticker)
+        return obj.income_stmt if (hasattr(obj,"income_stmt") and not obj.income_stmt.empty) else obj.financials
+    d = safe_yf_call(_fetch)
+    return d if d is not None else pd.DataFrame()
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=21600)
 def cached_balance_sheet(ticker):
-    obj = yf.Ticker(ticker)
-    return obj.balance_sheet if (hasattr(obj,"balance_sheet") and not obj.balance_sheet.empty) else None
+    def _fetch():
+        obj = yf.Ticker(ticker)
+        return obj.balance_sheet if (hasattr(obj,"balance_sheet") and not obj.balance_sheet.empty) else None
+    return safe_yf_call(_fetch)
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=21600)
 def cached_cashflow(ticker):
-    obj = yf.Ticker(ticker)
-    return obj.cashflow if (hasattr(obj,"cashflow") and not obj.cashflow.empty) else None
+    def _fetch():
+        obj = yf.Ticker(ticker)
+        return obj.cashflow if (hasattr(obj,"cashflow") and not obj.cashflow.empty) else None
+    return safe_yf_call(_fetch)
 
 @st.cache_data(ttl=3600)
 def cached_upgrades(ticker):
-    return yf.Ticker(ticker).upgrades_downgrades
+    return safe_yf_call(lambda: yf.Ticker(ticker).upgrades_downgrades)
 
 @st.cache_data(ttl=3600)
 def cached_recs(ticker):
-    return yf.Ticker(ticker).recommendations
+    return safe_yf_call(lambda: yf.Ticker(ticker).recommendations)
 
 @st.cache_data(ttl=3600)
 def fetch_macro_yield(ticker, fallback):
     if ticker is None: return fallback
-    try:
-        d = yf.Ticker(ticker).history(period="1d")
-        if not d.empty: return float(d["Close"].iloc[-1])
-    except: pass
+    d = safe_yf_call(lambda: yf.Ticker(ticker).history(period="1d"))
+    if d is not None and not d.empty: return float(d["Close"].iloc[-1])
     return fallback
 
 @st.cache_data(ttl=3600)
@@ -72,6 +106,7 @@ def get_peer_multiples(peers):
     for sym in peers:
         try:
             info = cached_info(sym)
+            if not info: continue
             name = info.get("shortName") or info.get("longName") or sym
             price = info.get("currentPrice") or info.get("regularMarketPrice")
             pe    = info.get("trailingPE")
@@ -84,6 +119,7 @@ def get_peer_multiples(peers):
                          "Price":price,"P/E":pe,"EV/EBITDA":eveb,
                          "P/B":pb,"Mkt Cap":mc,"52W High":hi52,"52W Low":lo52})
         except: pass
+        time.sleep(0.15)   # self-throttle across peer calls instead of bursting all at once
     return pd.DataFrame(rows)
 
 # ── SEARCH ────────────────────────────────────────────────────────────────────
@@ -535,7 +571,7 @@ if menu == "📋 Fundamental Deep Dive":
                         "Date": pd.to_datetime(df_up[dc]).dt.strftime("%d %b %Y"),
                         "Action": df_up[ac].str.title() if ac else "N/A",
                         "To Grade": df_up[gc],
-                    }), use_container_width=True, hide_index=True)
+                    }), width="stretch", hide_index=True)
                 else: st.info("Rating data unavailable.")
             else:
                 recs = cached_recs(ticker_sym)
@@ -550,7 +586,7 @@ if menu == "📋 Fundamental Deep Dive":
                             color=alt.Color("Rating:N",scale=alt.Scale(
                                 domain=["Strong Buy","Buy","Hold","Sell","Strong Sell"],
                                 range=["#2ed573","#10ac84","#e1b12c","#ff6b81","#ff4757"]),legend=None)
-                        ).properties(height=200),use_container_width=True)
+                        ).properties(height=200),width="stretch")
                 else: st.info("No analyst data available.")
         except Exception as e: st.caption(f"Analyst data: {e}")
 
@@ -653,13 +689,13 @@ if menu == "📋 Fundamental Deep Dive":
                                 domain=["Gross Margin","EBITDA Margin","Net Margin"],
                                 range=["#10ac84","#0abde3","#e1b12c"])),
                             tooltip=["Year","Metric","Value"]
-                        ).properties(height=220,title="Margin Trends"),use_container_width=True)
+                        ).properties(height=220,title="Margin Trends"),width="stretch")
                 with mc2:
                     melt2 = mdf.melt("Year",["ROE"],"Metric","Value").dropna()
                     if not melt2.empty:
                         st.altair_chart(alt.Chart(melt2).mark_bar(color="#e84393",cornerRadiusTopLeft=4,cornerRadiusTopRight=4).encode(
                             x=alt.X("Year:O"),y=alt.Y("Value:Q",title="ROE (%)"),tooltip=["Year","Value"]
-                        ).properties(height=220,title="Return on Equity (%)"),use_container_width=True)
+                        ).properties(height=220,title="Return on Equity (%)"),width="stretch")
     except Exception as e:
         st.info(f"Margin trend data unavailable: {e}")
     st.markdown("---")
@@ -696,6 +732,68 @@ if menu == "📋 Fundamental Deep Dive":
     if not interps: st.info("Insufficient data for ratio interpretation.")
     st.markdown("---")
 
+    # ── Credit & Quality Screens: Altman Z-Score / Piotroski F-Score ───────
+    st.markdown("### 🧪 Credit & Quality Screens")
+    try:
+        ta0 = safe_get(bs,"Total Assets",col=0);  ta1 = safe_get(bs,"Total Assets",col=1)
+        tl0 = safe_get(bs,"Total Liabilities Net Minority Interest",col=0)
+        re0 = safe_get(bs,"Retained Earnings",col=0)
+        ca0 = safe_get(bs,"Current Assets",col=0); cl0 = safe_get(bs,"Current Liabilities",col=0)
+        ca1 = safe_get(bs,"Current Assets",col=1); cl1 = safe_get(bs,"Current Liabilities",col=1)
+        ltd0 = safe_get(bs,"Long Term Debt",col=0); ltd1 = safe_get(bs,"Long Term Debt",col=1)
+        ebit0 = safe_get(inc,"Operating Income",col=0)
+        rev0 = safe_get(inc,"Total Revenue","Operating Revenue",col=0)
+        rev1 = safe_get(inc,"Total Revenue","Operating Revenue",col=1)
+        gp0 = safe_get(inc,"Gross Profit",col=0); gp1 = safe_get(inc,"Gross Profit",col=1)
+        ni0 = safe_get(inc,"Net Income","Net Income Common Stockholders",col=0)
+        ni1 = safe_get(inc,"Net Income","Net Income Common Stockholders",col=1)
+        cfo0 = safe_get(cf,"Operating Cash Flow","Cash From Operations",col=0)
+        mkt_cap_now = info.get("marketCap")
+
+        zc1,zc2 = st.columns(2)
+
+        # ---- Altman Z-Score ----
+        with zc1:
+            st.markdown("#### Altman Z-Score")
+            if all(v is not None for v in [ta0,tl0,re0,ebit0,rev0,mkt_cap_now]) and ta0>0 and tl0>0:
+                wc0 = (ca0-cl0) if (ca0 is not None and cl0 is not None) else 0
+                A = wc0/ta0; B = re0/ta0; C = ebit0/ta0; D = mkt_cap_now/tl0; E = rev0/ta0
+                z = 1.2*A + 1.4*B + 3.3*C + 0.6*D + 1.0*E
+                if z>2.99:   zone,zcol = "SAFE ZONE","#2ed573"
+                elif z>1.81: zone,zcol = "GREY ZONE","#e1b12c"
+                else:        zone,zcol = "DISTRESS ZONE","#ff4757"
+                st.markdown(metric_card("Altman Z-Score",f"{z:.2f}","Z>2.99 safe · 1.81–2.99 grey · <1.81 distress",color=zcol),unsafe_allow_html=True)
+                st.caption(f"**{zone}** — bankruptcy-risk screen calibrated for manufacturers/industrials; treat with caution for banks, insurers, and asset-light services.")
+            else:
+                st.info("Insufficient balance sheet data for Z-Score.")
+
+        # ---- Piotroski F-Score ----
+        with zc2:
+            st.markdown("#### Piotroski F-Score")
+            roa0 = (ni0/ta0) if (ni0 is not None and ta0) else None
+            roa1 = (ni1/ta1) if (ni1 is not None and ta1) else None
+            conds = [
+                (ni0 > 0) if ni0 is not None else None,
+                (cfo0 > 0) if cfo0 is not None else None,
+                (roa0 > roa1) if (roa0 is not None and roa1 is not None) else None,
+                (cfo0 > ni0) if (cfo0 is not None and ni0 is not None) else None,
+                (ltd0/ta0 < ltd1/ta1) if all(v not in (None,0) for v in [ltd0,ltd1,ta0,ta1]) else None,
+                (ca0/cl0 > ca1/cl1) if all(v not in (None,0) for v in [ca0,cl0,ca1,cl1]) else None,
+                ((gp0/rev0) > (gp1/rev1)) if all(v not in (None,0) for v in [gp0,rev0,gp1,rev1]) else None,
+                (rev0/ta0 > rev1/ta1) if all(v not in (None,0) for v in [rev0,ta0,rev1,ta1]) else None,
+            ]
+            applicable = sum(1 for c in conds if c is not None)
+            pts        = sum(1 for c in conds if c is True)
+            if applicable >= 5:
+                fcol = "#2ed573" if pts>=applicable*0.75 else "#e1b12c" if pts>=applicable*0.5 else "#ff4757"
+                st.markdown(metric_card("Piotroski F-Score",f"{pts} / {applicable}","Higher = stronger fundamental trend (9-point scale; some criteria need data this provider doesn't return)",color=fcol),unsafe_allow_html=True)
+                st.caption(f"Scored on {applicable} of 9 standard criteria based on the two most recent fiscal years available.")
+            else:
+                st.info("Insufficient 2-year comparative data for a reliable F-Score.")
+    except Exception as e:
+        st.info(f"Credit/quality screens unavailable: {e}")
+    st.markdown("---")
+
     # ── News Feed ──────────────────────────────────────────────────────────
     st.markdown("### 📰 Latest News")
     nf=False
@@ -730,12 +828,12 @@ if menu == "📋 Fundamental Deep Dive":
         edf=pd.DataFrame(exp,columns=["Metric","Value"])
         ec1,ec2=st.columns(2)
         with ec1:
-            st.download_button("⬇️ Download CSV",edf.to_csv(index=False).encode(),f"{clean_sym}_fundamental.csv","text/csv",use_container_width=True)
+            st.download_button("⬇️ Download CSV",edf.to_csv(index=False).encode(),f"{clean_sym}_fundamental.csv","text/csv",width="stretch")
         with ec2:
             tr="".join(f"<tr><td>{m}</td><td><strong>{v}</strong></td></tr>" for m,v in exp)
             ih="".join(f"<div class='i'><strong>{ic} {lb}</strong><p>{tx.replace('**','')}</p></div>" for ic,lb,tx in interps)
             html=f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{company_name}</title><style>body{{font-family:Arial,sans-serif;max-width:800px;margin:40px auto;font-size:14px;}}h1{{border-bottom:2px solid #0abde3;padding-bottom:8px;}}h2{{color:#0abde3;}}table{{width:100%;border-collapse:collapse;}}td{{padding:8px 12px;border-bottom:1px solid #ddd;}}tr:nth-child(even) td{{background:#f4f6f8;}}.i{{background:#f0f8ff;border-left:4px solid #0abde3;padding:10px;margin:8px 0;border-radius:0 6px 6px 0;}}.i p{{margin:4px 0 0 0;}}.foot{{margin-top:40px;font-size:11px;color:#999;border-top:1px solid #ddd;padding-top:10px;}}</style></head><body><h1>{company_name}</h1><p><strong>Ticker:</strong> {ticker_sym} | <strong>Sector:</strong> {sector} | <strong>Industry:</strong> {industry}</p><h2>Key Metrics</h2><table>{tr}</table><h2>Interpretation</h2>{ih}<div class="foot">Global Market Terminal | Not investment advice</div></body></html>'
-            st.download_button("⬇️ Download PDF Report",html.encode(),f"{clean_sym}_fundamental.html","text/html",use_container_width=True)
+            st.download_button("⬇️ Download PDF Report",html.encode(),f"{clean_sym}_fundamental.html","text/html",width="stretch")
             st.caption("💡 Ctrl+P → Save as PDF for a clean one-pager.")
     except Exception as e:
         st.error(f"Export error: {e}")
@@ -791,6 +889,7 @@ elif menu == "🎯 Valuation Modeler":
         peers = [p.strip() for p in manual_override.split(",") if p.strip()]
     else:
         peers = get_peers(ticker_sym, sector, industry, is_indian)
+    peer_df = pd.DataFrame()   # always defined — avoids NameError later if peers ends up empty
     if peers:
         with st.spinner("Fetching peer multiples…"):
             peer_df = get_peer_multiples(peers)
@@ -825,7 +924,7 @@ elif menu == "🎯 Valuation Modeler":
                 if row.name == 0:
                     return ["background-color:#1a3a5c;color:white;font-weight:bold"]*len(row)
                 return [""]*len(row)
-            st.dataframe(disp.style.apply(highlight_target,axis=1), use_container_width=True, hide_index=True)
+            st.dataframe(disp.style.apply(highlight_target,axis=1), width="stretch", hide_index=True)
             st.caption("🔵 Highlighted row = target company")
     else:
         st.info("Peer basket not configured for this sector yet.")
@@ -865,7 +964,7 @@ elif menu == "🎯 Valuation Modeler":
                 with nh1:
                     st.altair_chart(alt.Chart(ndf).mark_line(point=True,color="#10ac84").encode(
                         x=alt.X("Fiscal Year:O"),y=alt.Y("Historical P/E:Q",scale=alt.Scale(zero=False)),
-                        tooltip=["Fiscal Year","Historical P/E"]).properties(height=230),use_container_width=True)
+                        tooltip=["Fiscal Year","Historical P/E"]).properties(height=230),width="stretch")
                 with nh2:
                     st.metric("Historical Median P/E",f"{hmed:.2f}x")
                     if isinstance(pe,(int,float)):
@@ -910,6 +1009,79 @@ elif menu == "🎯 Valuation Modeler":
             pv_tv=ev=eq_v=iv=upside=0
     st.markdown("---")
 
+    # ── Scenario DCF — Bull / Base / Bear ───────────────────────────────────
+    st.markdown("### 🎭 Scenario DCF — Bull / Base / Bear")
+    st.caption("Bear/Bull re-center your WACC and FCF-growth sliders above by a fixed swing — adjust the sliders to shift all three scenarios at once.")
+    try:
+        scenario_defs = [
+            ("Bear", 0.60,  0.020),
+            ("Base", 1.00,  0.000),
+            ("Bull", 1.40, -0.010),
+        ]
+        scen_rows = []
+        for name, growth_mult, wacc_delta in scenario_defs:
+            g_s = max(0.0, fcf_growth*growth_mult)
+            w_s = max(terminal_g+0.005, wacc+wacc_delta)
+            v_s = dcf_iv(base_fcf, g_s, w_s, terminal_g, total_cash, total_debt, shares)
+            if v_s is not None:
+                scen_rows.append({"Scenario":name,"WACC":w_s*100,"FCF Growth":g_s*100,
+                                   "Intrinsic Value":v_s,"Upside":((v_s-curr_px)/curr_px)*100})
+        if scen_rows:
+            sdf = pd.DataFrame(scen_rows)
+            se1,se2 = st.columns([1,1.2])
+            with se1:
+                disp_sdf = sdf.copy()
+                disp_sdf["WACC"] = disp_sdf["WACC"].map(lambda x: f"{x:.1f}%")
+                disp_sdf["FCF Growth"] = disp_sdf["FCF Growth"].map(lambda x: f"{x:.1f}%")
+                disp_sdf["Intrinsic Value"] = disp_sdf["Intrinsic Value"].map(lambda x: f"{currency}{x:,.2f}")
+                disp_sdf["Upside"] = disp_sdf["Upside"].map(lambda x: f"{x:+.1f}%")
+                st.dataframe(disp_sdf, width="stretch", hide_index=True)
+            with se2:
+                st.altair_chart(alt.Chart(sdf).mark_bar(cornerRadiusTopLeft=4,cornerRadiusTopRight=4).encode(
+                    x=alt.X("Scenario:N",sort=["Bear","Base","Bull"]),
+                    y=alt.Y("Intrinsic Value:Q",title=f"Intrinsic Value ({currency})"),
+                    color=alt.Color("Scenario:N",scale=alt.Scale(domain=["Bear","Base","Bull"],
+                                    range=["#ff4757","#e1b12c","#2ed573"]),legend=None),
+                    tooltip=["Scenario","Intrinsic Value","Upside"]
+                ).properties(height=240),width="stretch")
+            blended = sdf["Intrinsic Value"].mean()
+            bl_up = ((blended-curr_px)/curr_px)*100
+            st.info(f"Simple-average blended intrinsic value across scenarios: **{currency}{blended:,.2f}** ({bl_up:+.1f}% vs current price).")
+        else:
+            st.info("Scenario DCF unavailable for the current slider combination.")
+    except Exception as e:
+        st.info(f"Scenario DCF unavailable: {e}")
+    st.markdown("---")
+
+    # ── Dividend Discount Model ──────────────────────────────────────────────
+    st.markdown("### 💰 Dividend Discount Model (Gordon Growth)")
+    ddm_value = None
+    try:
+        div_rate = info.get("dividendRate")
+        if div_rate and div_rate > 0:
+            st.caption("Best suited for stable dividend payers — banks, utilities, insurers — where a cash-flow DCF is noisy or the balance sheet makes FCFF hard to define.")
+            dd1,dd2 = st.columns([1,1.5])
+            with dd1:
+                req_ret    = st.slider("Required Return (Cost of Equity) %",6.0,20.0,12.0,0.5,key="ddm_r")/100
+                div_growth = st.slider("Dividend Growth Rate %",0.0,12.0,5.0,0.5,key="ddm_g")/100
+            with dd2:
+                if req_ret > div_growth:
+                    d1 = div_rate*(1+div_growth)
+                    ddm_value = d1/(req_ret-div_growth)
+                    ddm_upside = ((ddm_value-curr_px)/curr_px)*100
+                    st.markdown("#### DDM Output")
+                    st.info(f"**DDM Intrinsic Value:**\n### {currency}{ddm_value:,.2f}")
+                    if ddm_upside>0: st.success(f"✅ Undervalued by **{ddm_upside:.1f}%** vs current {currency}{curr_px:,.2f}")
+                    else:            st.error(f"🚨 Overvalued by **{abs(ddm_upside):.1f}%** vs current {currency}{curr_px:,.2f}")
+                    st.caption(f"Current annual dividend: {currency}{div_rate:,.2f}/share · Implied next-year dividend (D1): {currency}{d1:,.2f}/share")
+                else:
+                    st.error("Required return must exceed the dividend growth rate.")
+        else:
+            st.info("No dividend history detected for this ticker — DDM isn't applicable.")
+    except Exception as e:
+        st.info(f"DDM unavailable: {e}")
+    st.markdown("---")
+
     # ── Sensitivity Analysis ───────────────────────────────────────────────
     st.markdown("### 🗺️ Sensitivity Analysis — WACC vs Terminal Growth")
     st.caption("Intrinsic value per share across WACC and terminal growth combinations. 🟢 = upside · 🔴 = downside vs current price.")
@@ -933,222 +1105,272 @@ elif menu == "🎯 Valuation Modeler":
     st.markdown(f'<div style="overflow-x:auto;"><table style="border-collapse:collapse;width:100%;"><thead><tr>{header_cols}</tr></thead><tbody>{body_rows}</tbody></table></div>',unsafe_allow_html=True)
     st.markdown("---")
 
+    # ── Football Field — Valuation Triangulation ────────────────────────────
+    st.markdown("### 🏈 Football Field — Valuation Triangulation")
+    st.caption("Every valuation method computed above, laid side by side. Red dashed line = current price.")
+    try:
+        ff_rows = []
+        dcf_vals = [dcf_iv(base_fcf,fcf_growth,w,g,total_cash,total_debt,shares) for w in wacc_steps for g in tg_steps]
+        dcf_vals = [v for v in dcf_vals if v is not None]
+        if dcf_vals:
+            ff_rows.append({"Method":"DCF (Sensitivity Range)","Low":min(dcf_vals),"High":max(dcf_vals)})
+        eps = info.get("trailingEps")
+        if eps and eps > 0 and not peer_df.empty:
+            peer_pes = peer_df["P/E"].dropna()
+            peer_pes = peer_pes[peer_pes > 0]
+            if len(peer_pes) >= 2:
+                ff_rows.append({"Method":"Peer P/E Implied","Low":peer_pes.min()*eps,"High":peer_pes.max()*eps})
+        if ddm_value is not None:
+            ff_rows.append({"Method":"DDM","Low":ddm_value*0.9,"High":ddm_value*1.1})
+        hi52 = info.get("fiftyTwoWeekHigh"); lo52 = info.get("fiftyTwoWeekLow")
+        if hi52 and lo52:
+            ff_rows.append({"Method":"52-Week Trading Range","Low":lo52,"High":hi52})
+        tlo = info.get("targetLowPrice"); thi = info.get("targetHighPrice")
+        if tlo and thi and thi > tlo:
+            ff_rows.append({"Method":"Analyst Target Range","Low":tlo,"High":thi})
+
+        if len(ff_rows) >= 2:
+            ffdf = pd.DataFrame(ff_rows)
+            ff_base = alt.Chart(ffdf).mark_bar(size=28,cornerRadius=4,color="#0abde3").encode(
+                y=alt.Y("Method:N",sort=None,title=""),
+                x=alt.X("Low:Q",title=f"Implied Value per Share ({currency})",scale=alt.Scale(zero=False)),
+                x2="High:Q",
+                tooltip=["Method","Low","High"])
+            ff_price = alt.Chart(pd.DataFrame({"x":[curr_px]})).mark_rule(color="#ff4757",strokeWidth=2,strokeDash=[6,3]).encode(x="x:Q")
+            st.altair_chart((ff_base+ff_price).properties(height=180),width="stretch")
+            st.caption(f"Current price: {currency}{curr_px:,.2f}. DDM range shown as ±10% around the point estimate for visual comparability, not a modeled confidence band.")
+        else:
+            st.info("Need at least two valuation methods (DCF, peer comps, DDM, analyst targets) to build a football field — currently showing fewer than that for this ticker.")
+    except Exception as e:
+        st.info(f"Football field unavailable: {e}")
+    st.markdown("---")
+
     # ── Excel Financial Model Builder ──────────────────────────────────────
     st.markdown("### 📥 Download Institutional Excel Financial Model")
-    st.caption("6-sheet ready-to-use model: Cover · DCF · Sensitivity · Peer Comps · 3-Statement Financials")
+    st.caption("7-sheet ready-to-use model: Cover · DCF · Sensitivity · Peer Comps · 3-Statement Financials")
 
     df_is = format_statement(cached_income_stmt(ticker_sym),"IS")
     df_bs = format_statement(cached_balance_sheet(ticker_sym),"BS")
     df_cf = format_statement(cached_cashflow(ticker_sym),"CF")
 
-    wb  = Workbook()
-    wb.remove(wb.active)
+    build_excel = st.button("🚀 Build Institutional Excel Model", width="stretch")
+    if build_excel:
+        with st.spinner("Building 7-sheet workbook…"):
+            wb  = Workbook()
+            wb.remove(wb.active)
 
-    # ── SHEET 1: COVER ────────────────────────────────────────────────────
-    ws = wb.create_sheet("Cover")
-    ws.column_dimensions["A"].width=28; ws.column_dimensions["B"].width=24
-    ws.column_dimensions["C"].width=24; ws.column_dimensions["D"].width=24
+            # ── SHEET 1: COVER ────────────────────────────────────────────────────
+            ws = wb.create_sheet("Cover")
+            ws.column_dimensions["A"].width=28; ws.column_dimensions["B"].width=24
+            ws.column_dimensions["C"].width=24; ws.column_dimensions["D"].width=24
 
-    ws.merge_cells("A1:D1")
-    t=ws["A1"]; t.value="GLOBAL MARKET TERMINAL — INSTITUTIONAL EQUITY RESEARCH"
-    t.fill=_H; t.font=Font(color="FFFFFF",bold=True,size=14); t.alignment=_CT
-    ws.row_dimensions[1].height=30
+            ws.merge_cells("A1:D1")
+            t=ws["A1"]; t.value="GLOBAL MARKET TERMINAL — INSTITUTIONAL EQUITY RESEARCH"
+            t.fill=_H; t.font=Font(color="FFFFFF",bold=True,size=14); t.alignment=_CT
+            ws.row_dimensions[1].height=30
 
-    ws.merge_cells("A2:D2")
-    t2=ws["A2"]; t2.value=info.get("longName",ticker_sym)
-    t2.font=Font(bold=True,size=16,color="1A3A5C"); t2.alignment=_CT
-    ws.row_dimensions[2].height=28
+            ws.merge_cells("A2:D2")
+            t2=ws["A2"]; t2.value=info.get("longName",ticker_sym)
+            t2.font=Font(bold=True,size=16,color="1A3A5C"); t2.alignment=_CT
+            ws.row_dimensions[2].height=28
 
-    ws.merge_cells("A3:D3")
-    t3=ws["A3"]; t3.value=f"{sector}  |  {info.get('industry','')}  |  {ticker_sym}"
-    t3.font=Font(color="555555",size=11); t3.alignment=_CT; ws.row_dimensions[3].height=18
+            ws.merge_cells("A3:D3")
+            t3=ws["A3"]; t3.value=f"{sector}  |  {info.get('industry','')}  |  {ticker_sym}"
+            t3.font=Font(color="555555",size=11); t3.alignment=_CT; ws.row_dimensions[3].height=18
 
-    ws.row_dimensions[4].height=8
+            ws.row_dimensions[4].height=8
 
-    for col,h in enumerate(["METRIC","VALUE","METRIC","VALUE"],1):
-        _c(ws,5,col,h,fill=_H,font=_FH,align=_CT)
+            for col,h in enumerate(["METRIC","VALUE","METRIC","VALUE"],1):
+                _c(ws,5,col,h,fill=_H,font=_FH,align=_CT)
 
-    kv=[("Current Price",f"{currency}{curr_px:,.2f}"),("Market Cap",fmt_money(mkt_cap,is_indian)),
-        ("Trailing P/E",f"{pe:.2f}x" if isinstance(pe,(int,float)) else str(pe)),
-        ("EV/EBITDA",f"{eveb:.2f}x" if isinstance(eveb,(int,float)) else str(eveb)),
-        ("Price/Book",f"{pb:.2f}x" if isinstance(pb,(int,float)) else str(pb)),
-        ("52W High",f"{currency}{info.get('fiftyTwoWeekHigh',0):,.2f}"),
-        ("52W Low",f"{currency}{info.get('fiftyTwoWeekLow',0):,.2f}"),
-        ("Intrinsic Value (DCF)",f"{currency}{iv:,.2f}"),
-        ("Implied Upside/Downside",f"{upside:+.2f}%"),
-        ("Analyst Consensus",info.get("recommendationKey","N/A").replace("_"," ").title()),
-        ("# Analysts",str(info.get("numberOfAnalystOpinions","N/A"))),
-        ("Beta",str(round(info.get("beta",0),2))),]
+            kv=[("Current Price",f"{currency}{curr_px:,.2f}"),("Market Cap",fmt_money(mkt_cap,is_indian)),
+                ("Trailing P/E",f"{pe:.2f}x" if isinstance(pe,(int,float)) else str(pe)),
+                ("EV/EBITDA",f"{eveb:.2f}x" if isinstance(eveb,(int,float)) else str(eveb)),
+                ("Price/Book",f"{pb:.2f}x" if isinstance(pb,(int,float)) else str(pb)),
+                ("52W High",f"{currency}{info.get('fiftyTwoWeekHigh',0):,.2f}"),
+                ("52W Low",f"{currency}{info.get('fiftyTwoWeekLow',0):,.2f}"),
+                ("Intrinsic Value (DCF)",f"{currency}{iv:,.2f}"),
+                ("Implied Upside/Downside",f"{upside:+.2f}%"),
+                ("Analyst Consensus",info.get("recommendationKey","N/A").replace("_"," ").title()),
+                ("# Analysts",str(info.get("numberOfAnalystOpinions","N/A"))),
+                ("Beta",str(round(info.get("beta",0),2))),]
 
-    for i in range(0,len(kv),2):
-        row=6+i//2
-        _c(ws,row,1,kv[i][0],fill=_CA,font=_FB,align=_LT)
-        val_cell=_c(ws,row,2,kv[i][1],fill=_WH,align=_RT)
-        if i+1<len(kv):
-            _c(ws,row,3,kv[i+1][0],fill=_CA,font=_FB,align=_LT)
-            _c(ws,row,4,kv[i+1][1],fill=_WH,align=_RT)
+            for i in range(0,len(kv),2):
+                row=6+i//2
+                _c(ws,row,1,kv[i][0],fill=_CA,font=_FB,align=_LT)
+                val_cell=_c(ws,row,2,kv[i][1],fill=_WH,align=_RT)
+                if i+1<len(kv):
+                    _c(ws,row,3,kv[i+1][0],fill=_CA,font=_FB,align=_LT)
+                    _c(ws,row,4,kv[i+1][1],fill=_WH,align=_RT)
 
-    sumrow=6+len(kv)//2+2
-    ws.merge_cells(start_row=sumrow,start_column=1,end_row=sumrow,end_column=4)
-    ws.cell(row=sumrow,column=1,value="Business Summary").font=Font(bold=True,size=10,color="1A3A5C")
-    sumrow+=1
-    ws.merge_cells(start_row=sumrow,start_column=1,end_row=sumrow+4,end_column=4)
-    full_summary = info.get("longBusinessSummary","")
-    sc=ws.cell(row=sumrow,column=1,value=full_summary)
-    sc.alignment=Alignment(wrap_text=True,vertical="top"); ws.row_dimensions[sumrow].height=80
+            sumrow=6+len(kv)//2+2
+            ws.merge_cells(start_row=sumrow,start_column=1,end_row=sumrow,end_column=4)
+            ws.cell(row=sumrow,column=1,value="Business Summary").font=Font(bold=True,size=10,color="1A3A5C")
+            sumrow+=1
+            ws.merge_cells(start_row=sumrow,start_column=1,end_row=sumrow+4,end_column=4)
+            full_summary = info.get("longBusinessSummary","")
+            sc=ws.cell(row=sumrow,column=1,value=full_summary)
+            sc.alignment=Alignment(wrap_text=True,vertical="top"); ws.row_dimensions[sumrow].height=80
 
-    # ── SHEET 2: DCF VALUATION ────────────────────────────────────────────
-    ws2=wb.create_sheet("DCF Valuation")
-    for col,w in enumerate([30,20,20,20,20,20,20],1):
-        ws2.column_dimensions[get_column_letter(col)].width=w
+            # ── SHEET 2: DCF VALUATION ────────────────────────────────────────────
+            ws2=wb.create_sheet("DCF Valuation")
+            for col,w in enumerate([30,20,20,20,20,20,20],1):
+                ws2.column_dimensions[get_column_letter(col)].width=w
 
-    _hrow(ws2,1,"DCF VALUATION MODEL — DISCOUNTED CASH FLOW ANALYSIS",7)
-    _shrow(ws2,3,"ASSUMPTIONS (Yellow = Modifiable Inputs)",7)
-    assumptions=[
-        ("WACC (Cost of Capital)",wacc*100,"%"),
-        ("FCF Growth Rate (Years 1–5)",fcf_growth*100,"%"),
-        ("Terminal Growth Rate",terminal_g*100,"%"),
-        ("Base Free Cash Flow",base_fcf,"abs"),
-        ("Total Cash & Equivalents",total_cash,"abs"),
-        ("Total Debt",total_debt,"abs"),
-        ("Diluted Shares Outstanding",shares,"abs"),
-    ]
-    for i,(lbl,val,typ) in enumerate(assumptions):
-        r=4+i
-        _c(ws2,r,1,lbl,fill=_CA,font=_FB,align=_LT)
-        fmt="#,##0.00%" if typ=="%" else "#,##0"
-        dval=val/100 if typ=="%" else val
-        _c(ws2,r,2,dval,fill=_IN,font=_FI,align=_RT,fmt=fmt)
+            _hrow(ws2,1,"DCF VALUATION MODEL — DISCOUNTED CASH FLOW ANALYSIS",7)
+            _shrow(ws2,3,"ASSUMPTIONS (Yellow = Modifiable Inputs)",7)
+            assumptions=[
+                ("WACC (Cost of Capital)",wacc*100,"%"),
+                ("FCF Growth Rate (Years 1–5)",fcf_growth*100,"%"),
+                ("Terminal Growth Rate",terminal_g*100,"%"),
+                ("Base Free Cash Flow",base_fcf,"abs"),
+                ("Total Cash & Equivalents",total_cash,"abs"),
+                ("Total Debt",total_debt,"abs"),
+                ("Diluted Shares Outstanding",shares,"abs"),
+            ]
+            for i,(lbl,val,typ) in enumerate(assumptions):
+                r=4+i
+                _c(ws2,r,1,lbl,fill=_CA,font=_FB,align=_LT)
+                fmt="#,##0.00%" if typ=="%" else "#,##0"
+                dval=val/100 if typ=="%" else val
+                _c(ws2,r,2,dval,fill=_IN,font=_FI,align=_RT,fmt=fmt)
 
-    _shrow(ws2,12,"PROJECTION TABLE (Years 1–5)",7)
-    yr_hdrs=["Metric"]+[f"Year {y}" for y in range(1,6)]
-    for c,h in enumerate(yr_hdrs,1):
-        _c(ws2,13,c,h,fill=_H,font=_FH,align=_CT)
+            _shrow(ws2,12,"PROJECTION TABLE (Years 1–5)",7)
+            yr_hdrs=["Metric"]+[f"Year {y}" for y in range(1,6)]
+            for c,h in enumerate(yr_hdrs,1):
+                _c(ws2,13,c,h,fill=_H,font=_FH,align=_CT)
 
-    proj_rows=[
-        ("Projected FCF",          fcfs,                                          "#,##0"),
-        ("Discount Factor",        [1/((1+wacc)**y) for y in range(1,6)],         "0.0000"),
-        ("Present Value of FCF",   [fcfs[y]/((1+wacc)**(y+1)) for y in range(5)], "#,##0"),
-    ]
-    for ri,(lbl,vals,fmt_str) in enumerate(proj_rows):
-        r=14+ri
-        _c(ws2,r,1,lbl,fill=_CA,font=_FB,align=_LT)
-        for ci,v in enumerate(vals):
-            _c(ws2,r,ci+2,round(v,6),fill=_WH,align=_RT,fmt=fmt_str)
+            proj_rows=[
+                ("Projected FCF",          fcfs,                                          "#,##0"),
+                ("Discount Factor",        [1/((1+wacc)**y) for y in range(1,6)],         "0.0000"),
+                ("Present Value of FCF",   [fcfs[y]/((1+wacc)**(y+1)) for y in range(5)], "#,##0"),
+            ]
+            for ri,(lbl,vals,fmt_str) in enumerate(proj_rows):
+                r=14+ri
+                _c(ws2,r,1,lbl,fill=_CA,font=_FB,align=_LT)
+                for ci,v in enumerate(vals):
+                    _c(ws2,r,ci+2,round(v,6),fill=_WH,align=_RT,fmt=fmt_str)
 
-    _shrow(ws2,18,"VALUATION BRIDGE",7)
-    bridge=[
-        ("Sum of PV FCFs (Years 1–5)",      pv_fcf),
-        ("PV of Terminal Value",             pv_tv),
-        ("(+) Cash & Equivalents",           total_cash),
-        ("(–) Total Debt",                   -total_debt),
-        ("Implied Enterprise Value",         ev),
-        ("Implied Equity Value",             eq_v),
-        ("Diluted Shares Outstanding",       shares),
-        ("INTRINSIC VALUE PER SHARE",        iv),
-        ("Current Market Price",             curr_px),
-        ("Implied Upside / (Downside)",      upside/100),
-    ]
-    for i,(lbl,val) in enumerate(bridge):
-        r=19+i
-        is_total=lbl.startswith("=") or lbl.startswith("INTRINSIC")
-        is_upside="Upside" in lbl
-        fill=_PO if (is_total and val>0) else _NE if (is_total and val<0) else _CA if is_total else _WH
-        font=_FG if (is_total and val>0) else _FR if (is_total and val<0) else _FB if is_total else None
-        fmt="0.00%" if is_upside else "#,##0"
-        _c(ws2,r,1,lbl,fill=_CA if not is_total else fill,font=_FB,align=_LT)
-        _c(ws2,r,2,val,fill=fill,font=font,align=_RT,fmt=fmt)
+            _shrow(ws2,18,"VALUATION BRIDGE",7)
+            bridge=[
+                ("Sum of PV FCFs (Years 1–5)",      pv_fcf),
+                ("PV of Terminal Value",             pv_tv),
+                ("(+) Cash & Equivalents",           total_cash),
+                ("(–) Total Debt",                   -total_debt),
+                ("Implied Enterprise Value",         ev),
+                ("Implied Equity Value",             eq_v),
+                ("Diluted Shares Outstanding",       shares),
+                ("INTRINSIC VALUE PER SHARE",        iv),
+                ("Current Market Price",             curr_px),
+                ("Implied Upside / (Downside)",      upside/100),
+            ]
+            for i,(lbl,val) in enumerate(bridge):
+                r=19+i
+                is_total=lbl.startswith("=") or lbl.startswith("INTRINSIC")
+                is_upside="Upside" in lbl
+                fill=_PO if (is_total and val>0) else _NE if (is_total and val<0) else _CA if is_total else _WH
+                font=_FG if (is_total and val>0) else _FR if (is_total and val<0) else _FB if is_total else None
+                fmt="0.00%" if is_upside else "#,##0"
+                _c(ws2,r,1,lbl,fill=_CA if not is_total else fill,font=_FB,align=_LT)
+                _c(ws2,r,2,val,fill=fill,font=font,align=_RT,fmt=fmt)
 
-    # ── SHEET 3: SENSITIVITY ──────────────────────────────────────────────
-    ws3=wb.create_sheet("Sensitivity Matrix")
-    for col,w in enumerate([12]+[14]*7,1):
-        ws3.column_dimensions[get_column_letter(col)].width=w
-    _hrow(ws3,1,"SENSITIVITY ANALYSIS — Intrinsic Value per Share",8)
-    _shrow(ws3,2,"Rows = WACC | Columns = Terminal Growth Rate",8)
-    ws3.cell(row=3,column=1,value="WACC \\ g").fill=_H
-    ws3.cell(row=3,column=1).font=_FH; ws3.cell(row=3,column=1).alignment=_CT
-    for j,g in enumerate(tg_steps):
-        _c(ws3,3,j+2,f"{g*100:.1f}%",fill=_H,font=_FH,align=_CT)
-    for i,w in enumerate(wacc_steps):
-        _c(ws3,4+i,1,f"{w*100:.1f}%",fill=_SH,font=Font(color="FFFFFF",bold=True),align=_CT)
-        for j,g in enumerate(tg_steps):
-            val=dcf_iv(base_fcf,fcf_growth,w,g,total_cash,total_debt,shares)
-            if val is None: cell=_c(ws3,4+i,j+2,"N/A",fill=_AL,align=_CT)
-            else:
-                cell=_c(ws3,4+i,j+2,round(val,2),fill=_PO if val>curr_px else _NE,
-                         font=_FG if val>curr_px else _FR,align=_CT,fmt="#,##0.00")
+            # ── SHEET 3: SENSITIVITY ──────────────────────────────────────────────
+            ws3=wb.create_sheet("Sensitivity Matrix")
+            for col,w in enumerate([12]+[14]*7,1):
+                ws3.column_dimensions[get_column_letter(col)].width=w
+            _hrow(ws3,1,"SENSITIVITY ANALYSIS — Intrinsic Value per Share",8)
+            _shrow(ws3,2,"Rows = WACC | Columns = Terminal Growth Rate",8)
+            ws3.cell(row=3,column=1,value="WACC \\ g").fill=_H
+            ws3.cell(row=3,column=1).font=_FH; ws3.cell(row=3,column=1).alignment=_CT
+            for j,g in enumerate(tg_steps):
+                _c(ws3,3,j+2,f"{g*100:.1f}%",fill=_H,font=_FH,align=_CT)
+            for i,w in enumerate(wacc_steps):
+                _c(ws3,4+i,1,f"{w*100:.1f}%",fill=_SH,font=Font(color="FFFFFF",bold=True),align=_CT)
+                for j,g in enumerate(tg_steps):
+                    val=dcf_iv(base_fcf,fcf_growth,w,g,total_cash,total_debt,shares)
+                    if val is None: cell=_c(ws3,4+i,j+2,"N/A",fill=_AL,align=_CT)
+                    else:
+                        cell=_c(ws3,4+i,j+2,round(val,2),fill=_PO if val>curr_px else _NE,
+                                 font=_FG if val>curr_px else _FR,align=_CT,fmt="#,##0.00")
 
-    # ── SHEET 4: PEER COMPARABLES ─────────────────────────────────────────
-    ws4=wb.create_sheet("Peer Comparables")
-    for col,w in enumerate([28,14,14,12,14,12,16,14,14],1):
-        ws4.column_dimensions[get_column_letter(col)].width=w
-    _hrow(ws4,1,"PEER COMPARABLES — RELATIVE VALUATION ANALYSIS",9)
-    hdrs=["Company","Ticker","Price","P/E","EV/EBITDA","P/B","Mkt Cap (₹ Cr / $B)","52W High","52W Low"]
-    for c,h in enumerate(hdrs,1):
-        _c(ws4,2,c,h,fill=_H,font=_FH,align=_CT)
-    if not peer_df.empty:
-        trow={"Company":info.get("longName",clean_sym),"Ticker":ticker_sym,
-              "Price":curr_px,"P/E":pe if isinstance(pe,(int,float)) else None,
-              "EV/EBITDA":eveb if isinstance(eveb,(int,float)) else None,
-              "P/B":pb if isinstance(pb,(int,float)) else None,
-              "Mkt Cap":mkt_cap,
-              "52W High":info.get("fiftyTwoWeekHigh"),
-              "52W Low":info.get("fiftyTwoWeekLow")}
-        all_peers=[trow]+peer_df.to_dict("records")
-        for ri,row in enumerate(all_peers):
-            r=3+ri; is_t=ri==0
-            fill=PatternFill("solid",fgColor="1A3A5C") if is_t else (_AL if ri%2==0 else _WH)
-            fn=Font(color="FFFFFF",bold=True) if is_t else None
-            # Convert raw market cap to readable units (Cr for Indian, B for US)
-            raw_mc = row.get("Mkt Cap")
-            if raw_mc:
-                mc_display = raw_mc/10_000_000 if is_indian else raw_mc/1_000_000_000
-            else:
-                mc_display = None
-            _c(ws4,r,1,row.get("Company","")[:30],fill=fill,font=fn,align=_LT)
-            _c(ws4,r,2,row.get("Ticker",""),fill=fill,font=fn,align=_CT)
-            _c(ws4,r,3,row.get("Price"),fill=fill,font=fn,align=_RT,fmt="#,##0.00")
-            _c(ws4,r,4,row.get("P/E"),fill=fill,font=fn,align=_RT,fmt="#,##0.1")
-            _c(ws4,r,5,row.get("EV/EBITDA"),fill=fill,font=fn,align=_RT,fmt="#,##0.1")
-            _c(ws4,r,6,row.get("P/B"),fill=fill,font=fn,align=_RT,fmt="#,##0.1")
-            _c(ws4,r,7,mc_display,fill=fill,font=fn,align=_RT,fmt="#,##0.0")
-            _c(ws4,r,8,row.get("52W High"),fill=fill,font=fn,align=_RT,fmt="#,##0.0")
-            _c(ws4,r,9,row.get("52W Low"),fill=fill,font=fn,align=_RT,fmt="#,##0.0")
+            # ── SHEET 4: PEER COMPARABLES ─────────────────────────────────────────
+            ws4=wb.create_sheet("Peer Comparables")
+            for col,w in enumerate([28,14,14,12,14,12,16,14,14],1):
+                ws4.column_dimensions[get_column_letter(col)].width=w
+            _hrow(ws4,1,"PEER COMPARABLES — RELATIVE VALUATION ANALYSIS",9)
+            hdrs=["Company","Ticker","Price","P/E","EV/EBITDA","P/B","Mkt Cap (₹ Cr / $B)","52W High","52W Low"]
+            for c,h in enumerate(hdrs,1):
+                _c(ws4,2,c,h,fill=_H,font=_FH,align=_CT)
+            if not peer_df.empty:
+                trow={"Company":info.get("longName",clean_sym),"Ticker":ticker_sym,
+                      "Price":curr_px,"P/E":pe if isinstance(pe,(int,float)) else None,
+                      "EV/EBITDA":eveb if isinstance(eveb,(int,float)) else None,
+                      "P/B":pb if isinstance(pb,(int,float)) else None,
+                      "Mkt Cap":mkt_cap,
+                      "52W High":info.get("fiftyTwoWeekHigh"),
+                      "52W Low":info.get("fiftyTwoWeekLow")}
+                all_peers=[trow]+peer_df.to_dict("records")
+                for ri,row in enumerate(all_peers):
+                    r=3+ri; is_t=ri==0
+                    fill=PatternFill("solid",fgColor="1A3A5C") if is_t else (_AL if ri%2==0 else _WH)
+                    fn=Font(color="FFFFFF",bold=True) if is_t else None
+                    # Convert raw market cap to readable units (Cr for Indian, B for US)
+                    raw_mc = row.get("Mkt Cap")
+                    if raw_mc:
+                        mc_display = raw_mc/10_000_000 if is_indian else raw_mc/1_000_000_000
+                    else:
+                        mc_display = None
+                    _c(ws4,r,1,row.get("Company","")[:30],fill=fill,font=fn,align=_LT)
+                    _c(ws4,r,2,row.get("Ticker",""),fill=fill,font=fn,align=_CT)
+                    _c(ws4,r,3,row.get("Price"),fill=fill,font=fn,align=_RT,fmt="#,##0.00")
+                    _c(ws4,r,4,row.get("P/E"),fill=fill,font=fn,align=_RT,fmt="#,##0.1")
+                    _c(ws4,r,5,row.get("EV/EBITDA"),fill=fill,font=fn,align=_RT,fmt="#,##0.1")
+                    _c(ws4,r,6,row.get("P/B"),fill=fill,font=fn,align=_RT,fmt="#,##0.1")
+                    _c(ws4,r,7,mc_display,fill=fill,font=fn,align=_RT,fmt="#,##0.0")
+                    _c(ws4,r,8,row.get("52W High"),fill=fill,font=fn,align=_RT,fmt="#,##0.0")
+                    _c(ws4,r,9,row.get("52W Low"),fill=fill,font=fn,align=_RT,fmt="#,##0.0")
 
-    # ── SHEETS 5–7: FINANCIAL STATEMENTS ──────────────────────────────────
-    def write_fs_sheet(wb, name, df, divisor=1_000_000):
-        if df is None or df.empty: return
-        ws=wb.create_sheet(name)
-        ws.column_dimensions["A"].width=38
-        _hrow(ws,1,name.upper(),len(df.columns)+1)
-        _c(ws,2,1,"Line Item",fill=_H,font=_FH,align=_LT)
-        for ci,col in enumerate(df.columns,2):
-            _c(ws,2,ci,col,fill=_H,font=_FH,align=_CT)
-            ws.column_dimensions[get_column_letter(ci)].width=18
-        for ri,(idx,row) in enumerate(df.iterrows()):
-            r=3+ri
-            fill=_CA if any(k in idx for k in ["Revenue","Income","EBITDA","Profit","Total","Equity","Cash","Flow"]) else (_AL if ri%2==0 else _WH)
-            fb=_FB if fill==_CA else None
-            _c(ws,r,1,idx,fill=fill,font=fb,align=_LT)
-            for ci,val in enumerate(row,2):
-                try:
-                    nval=val/divisor if pd.notna(val) else None
-                    cell=_c(ws,r,ci,nval,fill=fill,align=_RT,fmt="#,##0.0")
-                    if nval and nval<0: cell.font=_FR
-                except: _c(ws,r,ci,None,fill=fill,align=_RT)
+            # ── SHEETS 5–7: FINANCIAL STATEMENTS ──────────────────────────────────
+            def write_fs_sheet(wb, name, df, divisor=1_000_000):
+                if df is None or df.empty: return
+                ws=wb.create_sheet(name)
+                ws.column_dimensions["A"].width=38
+                _hrow(ws,1,name.upper(),len(df.columns)+1)
+                _c(ws,2,1,"Line Item",fill=_H,font=_FH,align=_LT)
+                for ci,col in enumerate(df.columns,2):
+                    _c(ws,2,ci,col,fill=_H,font=_FH,align=_CT)
+                    ws.column_dimensions[get_column_letter(ci)].width=18
+                for ri,(idx,row) in enumerate(df.iterrows()):
+                    r=3+ri
+                    fill=_CA if any(k in idx for k in ["Revenue","Income","EBITDA","Profit","Total","Equity","Cash","Flow"]) else (_AL if ri%2==0 else _WH)
+                    fb=_FB if fill==_CA else None
+                    _c(ws,r,1,idx,fill=fill,font=fb,align=_LT)
+                    for ci,val in enumerate(row,2):
+                        try:
+                            nval=val/divisor if pd.notna(val) else None
+                            cell=_c(ws,r,ci,nval,fill=fill,align=_RT,fmt="#,##0.0")
+                            if nval and nval<0: cell.font=_FR
+                        except: _c(ws,r,ci,None,fill=fill,align=_RT)
 
-    write_fs_sheet(wb,"Income Statement (₹M)",df_is)
-    write_fs_sheet(wb,"Balance Sheet (₹M)",df_bs)
-    write_fs_sheet(wb,"Cash Flow (₹M)",df_cf)
+            write_fs_sheet(wb,"Income Statement (₹M)",df_is)
+            write_fs_sheet(wb,"Balance Sheet (₹M)",df_bs)
+            write_fs_sheet(wb,"Cash Flow (₹M)",df_cf)
 
-    buf=io.BytesIO()
-    wb.save(buf)
-    st.download_button(
-        label=f"🚀 Download Institutional Excel Model — {clean_sym}",
-        data=buf.getvalue(),
-        file_name=f"{clean_sym}_Institutional_Financial_Model.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True)
+            buf=io.BytesIO()
+            wb.save(buf)
+            st.session_state["excel_bytes_" + ticker_sym] = buf.getvalue()
+            st.session_state["excel_fname_" + ticker_sym] = f"{clean_sym}_Institutional_Financial_Model.xlsx"
+
+    dl_key = "excel_bytes_" + ticker_sym
+    fn_key = "excel_fname_" + ticker_sym
+    if dl_key in st.session_state:
+        st.download_button(
+            label=f"⬇️ Download {st.session_state[fn_key]}",
+            data=st.session_state[dl_key],
+            file_name=st.session_state[fn_key],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch")
+        st.caption("Model reflects the DCF assumptions at the time you clicked Build — re-click after changing sliders or switching tickers.")
     st.markdown("---")
 
     # ── 3-Year Financial Statements (Preview) ─────────────────────────────
@@ -1156,13 +1378,13 @@ elif menu == "🎯 Valuation Modeler":
     st.info("📌 **Sanity note:** Section totals (Total Assets, Total Liabilities, Operating CF etc.) are directly from company filings — accurate. Sub-items shown are significant ones only; not all components are returned by the data provider, so sub-items may not sum to totals. Balance sheet equation (Assets = Liabilities + Equity) is verified and holds.")
     t_is,t_bs,t_cf=st.tabs(["Income Statement","Balance Sheet","Cash Flow"])
     with t_is:
-        if not df_is.empty: st.dataframe((df_is/1e6).style.format("{:,.2f}"),use_container_width=True)
+        if not df_is.empty: st.dataframe((df_is/1e6).style.format("{:,.2f}"),width="stretch")
         else: st.info("Unavailable.")
     with t_bs:
-        if not df_bs.empty: st.dataframe((df_bs/1e6).style.format("{:,.2f}"),use_container_width=True)
+        if not df_bs.empty: st.dataframe((df_bs/1e6).style.format("{:,.2f}"),width="stretch")
         else: st.info("Unavailable.")
     with t_cf:
-        if not df_cf.empty: st.dataframe((df_cf/1e6).style.format("{:,.2f}"),use_container_width=True)
+        if not df_cf.empty: st.dataframe((df_cf/1e6).style.format("{:,.2f}"),width="stretch")
         else: st.info("Unavailable.")
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1257,7 +1479,7 @@ elif menu == "📈 Technical Analysis":
                                          "Color":["#0abde3","#e1b12c","#ff4757","#7f8fa6"]})
             price_chart = (bbu_l+bbl_l+bbm_l+d50_l+d200_l+price_l).properties(height=340,
                 title=f"{ticker_sym} — Price with 50/200 DMA & Bollinger Bands (20, ±2σ)")
-            st.altair_chart(price_chart,use_container_width=True)
+            st.altair_chart(price_chart,width="stretch")
 
             # ── RSI Chart ─────────────────────────────────────────────────
             st.markdown("### 📊 RSI (14)")
@@ -1269,7 +1491,7 @@ elif menu == "📈 Technical Analysis":
             ob  = alt.Chart(pd.DataFrame({"y":[70]})).mark_rule(color="#ff4757",strokeDash=[5,5],opacity=0.8).encode(y="y:Q")
             os  = alt.Chart(pd.DataFrame({"y":[30]})).mark_rule(color="#2ed573",strokeDash=[5,5],opacity=0.8).encode(y="y:Q")
             mid = alt.Chart(pd.DataFrame({"y":[50]})).mark_rule(color="#7f8fa6",strokeDash=[3,3],opacity=0.4).encode(y="y:Q")
-            st.altair_chart((rsi_line+ob+os+mid).properties(height=180),use_container_width=True)
+            st.altair_chart((rsi_line+ob+os+mid).properties(height=180),width="stretch")
 
             # ── MACD Chart ────────────────────────────────────────────────
             st.markdown("### 📊 MACD (12, 26, 9)")
@@ -1281,7 +1503,7 @@ elif menu == "📈 Technical Analysis":
                 tooltip=["Date:T","MACD:Q","MACD_Signal:Q","MACD_Hist:Q"])
             macd_l  = alt.Chart(macd_plot).mark_line(color="#0abde3",strokeWidth=1.5).encode(x="Date:T",y="MACD:Q")
             signal_l= alt.Chart(macd_plot).mark_line(color="#ff4757",strokeWidth=1.5,strokeDash=[4,2]).encode(x="Date:T",y="MACD_Signal:Q")
-            st.altair_chart((hist_bars+macd_l+signal_l).properties(height=180),use_container_width=True)
+            st.altair_chart((hist_bars+macd_l+signal_l).properties(height=180),width="stretch")
 
             # ── Volume Chart ──────────────────────────────────────────────
             st.markdown("### 📊 Volume")
@@ -1290,7 +1512,7 @@ elif menu == "📈 Technical Analysis":
                 y=alt.Y("Volume:Q",title="Volume"),
                 color=alt.condition(alt.datum.vol_up==1,alt.value("#2ed573"),alt.value("#ff4757")),
                 tooltip=["Date:T","Volume:Q"])
-            st.altair_chart(vol_chart.properties(height=140),use_container_width=True)
+            st.altair_chart(vol_chart.properties(height=140),width="stretch")
 
             st.markdown("""
             <div style="background:#1e272e;border-radius:6px;padding:12px 16px;font-size:12px;color:#7f8fa6;margin-top:8px;">
@@ -1389,7 +1611,7 @@ elif menu == "📊 Macro & CAPM":
                     x=alt.X("Benchmark:Q",title=f"{cfg['bench_name']} Daily Return (%)"),
                     y=alt.Y("Asset:Q",title="Asset Daily Return (%)"),tooltip=["Benchmark","Asset"])
                 reg=scatter.transform_regression("Benchmark","Asset").mark_line(color="#ff4757",size=2)
-                st.altair_chart((scatter+reg).properties(height=300,title=f"Beta Regression — {ticker_sym} vs {cfg['bench_name']}"),use_container_width=True)
+                st.altair_chart((scatter+reg).properties(height=300,title=f"Beta Regression — {ticker_sym} vs {cfg['bench_name']}"),width="stretch")
             else:
                 st.warning("Insufficient data for regression.")
         except Exception as e:
