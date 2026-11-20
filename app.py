@@ -1393,6 +1393,18 @@ elif menu == "🎯 Valuation Modeler":
 elif menu == "📈 Technical Analysis":
     st.markdown("## 📈 Technical Analysis Engine")
     st.markdown("*RSI, MACD, Bollinger Bands, 50/200 DMA crossover, and volume intelligence.*")
+    with st.expander("How to read these charts"):
+        st.markdown(
+            "**Price and trend** · The blue line is the closing price in the security's currency. "
+            "The yellow and red lines average the last 50 and 200 closes. "
+            "Choose a longer period if the chart has too few observations for an average.\n\n"
+            "**Bollinger Bands** · The grey lines show a 20-close average and bands two standard "
+            "deviations away. Wider bands indicate more recent price variation.\n\n"
+            "**RSI and MACD** · RSI shows recent gains versus losses on a 0–100 scale. "
+            "MACD compares faster and slower price averages, with a signal line to show changes "
+            "in momentum. Both describe past price moves.\n\n"
+            "**Volume** · Compare trading activity with nearby bars to put a price move in context."
+        )
     ticker_sym = ticker_search_widget()
     if not ticker_sym: st.stop()
     is_indian,currency,clean_sym,_,_,_ = ticker_meta(ticker_sym)
@@ -1480,6 +1492,11 @@ elif menu == "📈 Technical Analysis":
             price_chart = (bbu_l+bbl_l+bbm_l+d50_l+d200_l+price_l).properties(height=340,
                 title=f"{ticker_sym} — Price with 50/200 DMA & Bollinger Bands (20, ±2σ)")
             st.altair_chart(price_chart,width="stretch")
+            latest_bar = raw["Date"].iloc[-1].strftime("%d %b %Y")
+            st.caption(
+                f"Latest bar returned: {latest_bar} · {len(raw):,} observations · "
+                f"Currency: {currency} · Yahoo Finance history, cached for up to one hour."
+            )
 
             # ── RSI Chart ─────────────────────────────────────────────────
             st.markdown("### 📊 RSI (14)")
